@@ -2,6 +2,7 @@ package com.fujifilm.desqueeze
 
 import android.Manifest
 import android.content.ContentValues
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
@@ -13,6 +14,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.GlMatrixTransformation
@@ -30,7 +32,6 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 @UnstableApi
 class MainActivity : AppCompatActivity() {
@@ -45,7 +46,15 @@ class MainActivity : AppCompatActivity() {
     ) { uris ->
         if (uris.isEmpty()) return@registerForActivityResult
         selectedUris.clear()
-        selectedUris.addAll(uris)
+        for (uri in uris) {
+            // Keep persistent read permission so the URI stays valid across async ops
+            try {
+                contentResolver.takePersistableUriPermission(
+                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: SecurityException) { /* not all providers grant persistable permissions */ }
+            selectedUris.add(uri)
+        }
         binding.btnConvert.isEnabled = true
         val names = uris.joinToString("\n") { getFileName(it) }
         log("Selected ${uris.size} file(s):\n$names")
@@ -76,11 +85,10 @@ class MainActivity : AppCompatActivity() {
         else
             Manifest.permission.READ_EXTERNAL_STORAGE
 
-        if (ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED) {
+        if (ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED)
             pickVideos.launch(arrayOf("video/*"))
-        } else {
+        else
             requestPermission.launch(permission)
-        }
     }
 
     // ── Conversion ───────────────────────────────────────────────────────────
@@ -113,78 +121,94 @@ class MainActivity : AppCompatActivity() {
     }
 
     private suspend fun convertFile(uri: Uri, originalName: String): Boolean {
-        // 1. Probe source dimensions
-        val (srcW, srcH) = probeWidthHeight(uri)
+        // Probe dimensions on IO thread
+        val (srcW, srcH) = withContext(Dispatchers.IO) { probeWidthHeight(uri) }
         if (srcW <= 0 || srcH <= 0) {
-            uiLog("  ERROR: could not read video dimensions")
+            uiLog("  ERROR: could not read video dimensions (unsupported format?)")
             return false
         }
         val newW = (srcW * squeeze / 2).toInt() * 2
         uiLog("  ${srcW}×${srcH}  →  desqueeze  →  ${newW}×${srcH}")
 
-        // 2. Temp output file in cache (Transformer needs a file path)
         val tmpOut = File(cacheDir, "desqueeze_${System.currentTimeMillis()}.mp4")
-
-        return try {
-            // 3. Run transformer on a background thread
-            val ok = withContext(Dispatchers.Main) {
+        try {
+            // Transformer must run on Main; suspendCancellableCoroutine wraps the async callback
+            val exportError = withContext(Dispatchers.Main) {
                 runTransformer(uri, tmpOut.absolutePath, squeeze)
             }
-            if (!ok) return false
 
-            // 4. Copy temp file into MediaStore (Movies/FujiDesqueeze/)
+            if (exportError != null) {
+                uiLog("  ERROR: $exportError")
+                return false
+            }
+
+            // Copy from cache to MediaStore (Movies/FujiDesqueeze/)
+            val outputName = originalName.substringBeforeLast('.') + "_desqueezed.mp4"
+            val destUri = withContext(Dispatchers.IO) { createOutputUri(outputName) }
+            if (destUri == null) {
+                uiLog("  ERROR: could not create output file in MediaStore")
+                return false
+            }
             withContext(Dispatchers.IO) {
-                val outputName = originalName.substringBeforeLast(".") + "_desqueezed.mp4"
-                val destUri = createOutputUri(outputName)
-                if (destUri == null) {
-                    uiLog("  ERROR: could not create output in MediaStore")
-                    return@withContext false
-                }
                 contentResolver.openOutputStream(destUri)?.use { out ->
                     tmpOut.inputStream().use { it.copyTo(out) }
                 }
-                uiLog("  Saved → Movies/FujiDesqueeze/$outputName")
-                true
             }
+            uiLog("  Saved → Movies/FujiDesqueeze/$outputName")
+            return true
+        } catch (e: Exception) {
+            uiLog("  ERROR: ${e.javaClass.simpleName}: ${e.message}")
+            return false
         } finally {
             tmpOut.delete()
         }
     }
 
-    // Transformer must run on the main thread; we wrap it in a coroutine suspending call.
-    private suspend fun runTransformer(inputUri: Uri, outputPath: String, squeeze: Float): Boolean =
-        suspendCancellableCoroutine { cont ->
-            val desqueeze = DesqueezeTransformation(squeeze)
-            val effects = Effects(emptyList(), listOf(desqueeze))
+    // Returns null on success, or an error string on failure.
+    // Must be called on the Main thread (Transformer requirement).
+    private suspend fun runTransformer(
+        inputUri: Uri,
+        outputPath: String,
+        squeeze: Float,
+    ): String? = suspendCancellableCoroutine { cont ->
 
-            val editedItem = EditedMediaItem.Builder(MediaItem.fromUri(inputUri))
-                .setEffects(effects)
-                .build()
+        val desqueeze = DesqueezeTransformation(squeeze)
+        val effects = Effects(emptyList(), listOf(desqueeze))
 
-            val transformer = Transformer.Builder(this)
-                .build()
+        val editedItem = EditedMediaItem.Builder(MediaItem.fromUri(inputUri))
+            .setEffects(effects)
+            .build()
 
-            transformer.addListener(object : Transformer.Listener {
-                override fun onCompleted(composition: Composition, result: ExportResult) {
-                    if (cont.isActive) cont.resume(true)
-                }
-                override fun onError(
-                    composition: Composition,
-                    result: ExportResult,
-                    exception: ExportException,
-                ) {
-                    if (cont.isActive) cont.resumeWithException(exception)
-                }
-            })
+        val transformer = Transformer.Builder(this@MainActivity)
+            // Explicitly transcode PCM S24 LE (Fujifilm) → AAC in the MP4 container
+            .setAudioMimeType(MimeTypes.AUDIO_AAC)
+            // Output as H.264 (universally compatible MP4)
+            .setVideoMimeType(MimeTypes.VIDEO_H264)
+            .build()
 
-            cont.invokeOnCancellation { transformer.cancel() }
-
-            try {
-                transformer.start(editedItem, outputPath)
-            } catch (e: Exception) {
-                if (cont.isActive) cont.resumeWithException(e)
+        transformer.addListener(object : Transformer.Listener {
+            override fun onCompleted(composition: Composition, result: ExportResult) {
+                if (cont.isActive) cont.resume(null)
             }
+            override fun onError(
+                composition: Composition,
+                result: ExportResult,
+                exception: ExportException,
+            ) {
+                if (cont.isActive) cont.resume(
+                    "ExportException ${exception.errorCode}: ${exception.message}"
+                )
+            }
+        })
+
+        cont.invokeOnCancellation { transformer.cancel() }
+
+        try {
+            transformer.start(editedItem, outputPath)
+        } catch (e: Exception) {
+            if (cont.isActive) cont.resume("${e.javaClass.simpleName}: ${e.message}")
         }
+    }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -197,6 +221,8 @@ class MainActivity : AppCompatActivity() {
             val h = retriever.extractMetadata(
                 android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
             Pair(w, h)
+        } catch (e: Exception) {
+            Pair(0, 0)
         } finally {
             retriever.release()
         }
@@ -232,8 +258,8 @@ class MainActivity : AppCompatActivity() {
 }
 
 // ── Desqueeze GL transformation ───────────────────────────────────────────────
-// configure() returns the wider output canvas; identity matrix causes the
-// input texture to be stretched (not cropped) to fill the wider output.
+// configure() returns the wider output canvas; identity GL matrix causes the
+// input texture to stretch (not crop) to fill the wider output = desqueeze.
 @UnstableApi
 class DesqueezeTransformation(private val squeezeFactor: Float) : GlMatrixTransformation {
 
@@ -243,8 +269,8 @@ class DesqueezeTransformation(private val squeezeFactor: Float) : GlMatrixTransf
     }
 
     override fun getGlMatrixArray(presentationTimeUs: Long): FloatArray {
-        val matrix = FloatArray(16)
-        android.opengl.Matrix.setIdentityM(matrix, 0)
-        return matrix
+        val m = FloatArray(16)
+        android.opengl.Matrix.setIdentityM(m, 0)
+        return m
     }
 }
