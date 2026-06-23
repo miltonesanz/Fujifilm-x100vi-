@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Fuji Desqueeze</string>
+    <string name="pick_files">Pick MOV Files</string>
+    <string name="convert">Convert</string>
+    <string name="pick_hint">Tap \"Pick MOV Files\" to get started</string>
+</resources>
